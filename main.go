@@ -11,6 +11,7 @@ import (
     "strings"
     "sync/atomic"
     "time"
+    "sort"
 
     "github.com/google/uuid"
     "github.com/joho/godotenv"
@@ -241,12 +242,46 @@ func main() {
     })
 
     mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
-        dbChirps, err := apiCfg.dbQueries.GetChirps(r.Context())
-        if err != nil {
-            respondWithError(w, http.StatusInternalServerError, "Failed to retrieve chirps")
-            return
+        var dbChirps []database.Chirp
+        var err error
+
+        // 1. Parse author_id filter
+        authorIDStr := r.URL.Query().Get("author_id")
+        if authorIDStr != "" {
+            authorID, parseErr := uuid.Parse(authorIDStr)
+            if parseErr != nil {
+                respondWithError(w, http.StatusBadRequest, "Invalid author_id format")
+                return
+            }
+            dbChirps, err = apiCfg.dbQueries.GetChirpsByAuthor(r.Context(), authorID)
+            if err != nil {
+                respondWithError(w, http.StatusInternalServerError, "Failed to retrieve chirps for author")
+                return
+            }
+        } else {
+            dbChirps, err = apiCfg.dbQueries.GetChirps(r.Context())
+            if err != nil {
+                respondWithError(w, http.StatusInternalServerError, "Failed to retrieve chirps")
+                return
+            }
         }
 
+        // 2. Parse sort parameter (default: asc)
+        sortParam := r.URL.Query().Get("sort")
+        if sortParam == "" {
+            sortParam = "asc"
+        }
+
+        // 3. Sort in memory using sort.Slice
+        sort.Slice(dbChirps, func(i, j int) bool {
+            if sortParam == "desc" {
+                return dbChirps[i].CreatedAt.After(dbChirps[j].CreatedAt)
+            }
+            // default: asc
+            return dbChirps[i].CreatedAt.Before(dbChirps[j].CreatedAt)
+        })
+
+        // 4. Map to main.Chirp structs
         chirps := make([]Chirp, 0, len(dbChirps))
         for _, dbChirp := range dbChirps {
             chirps = append(chirps, Chirp{
