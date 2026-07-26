@@ -280,6 +280,73 @@ func main() {
         respondWithJSON(w, http.StatusCreated, user)
     })
 
+    mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+        // 1. Extract and validate JWT
+        token, err := auth.GetBearerToken(r.Header)
+        if err != nil {
+            respondWithError(w, http.StatusUnauthorized, err.Error())
+            return
+        }
+
+        userID, err := auth.ValidateJWT(token, apiCfg.jwtSecret)
+        if err != nil {
+            respondWithError(w, http.StatusUnauthorized, "Invalid or expired token")
+            return
+        }
+
+        // 2. Parse request body
+        var request struct {
+            Email    string `json:"email"`
+            Password string `json:"password"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+            respondWithError(w, http.StatusBadRequest, "Invalid request body")
+            return
+        }
+
+        // 3. Validate inputs
+        if request.Email == "" {
+            respondWithError(w, http.StatusBadRequest, "Email is required")
+            return
+        }
+        if len(request.Password) < 4 {
+            respondWithError(w, http.StatusBadRequest, "Password must be at least 4 characters")
+            return
+        }
+
+        // 4. Hash the new password
+        hashedPassword, err := auth.HashPassword(request.Password)
+        if err != nil {
+            respondWithError(w, http.StatusInternalServerError, "Failed to hash password")
+            return
+        }
+
+        // 5. Update user in database
+        dbUser, err := apiCfg.dbQueries.UpdateUser(r.Context(), database.UpdateUserParams{
+            Email:          request.Email,
+            HashedPassword: hashedPassword,
+            ID:             userID,
+        })
+        if err != nil {
+            if strings.Contains(err.Error(), "duplicate key") {
+                respondWithError(w, http.StatusConflict, "Email already exists")
+                return
+            }
+            log.Printf("❌ UpdateUser error: %v", err)
+            respondWithError(w, http.StatusInternalServerError, "Failed to update user")
+            return
+        }
+
+        // 6. Return updated user (without password)
+        user := User{
+            ID:        dbUser.ID,
+            CreatedAt: dbUser.CreatedAt,
+            UpdatedAt: dbUser.UpdatedAt,
+            Email:     dbUser.Email,
+        }
+        respondWithJSON(w, http.StatusOK, user)
+    })
+
     mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
         dbChirps, err := apiCfg.dbQueries.GetChirps(r.Context())
         if err != nil {
@@ -328,6 +395,56 @@ func main() {
         }
 
         respondWithJSON(w, http.StatusOK, chirp)
+    })
+
+    mux.HandleFunc("DELETE /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+        // 1. Extract and validate JWT
+        token, err := auth.GetBearerToken(r.Header)
+        if err != nil {
+            respondWithError(w, http.StatusUnauthorized, err.Error())
+            return
+        }
+
+        userID, err := auth.ValidateJWT(token, apiCfg.jwtSecret)
+        if err != nil {
+            respondWithError(w, http.StatusUnauthorized, "Invalid or expired token")
+            return
+        }
+
+        // 2. Get chirp ID from URL
+        chirpIDStr := r.PathValue("chirpID")
+        chirpID, err := uuid.Parse(chirpIDStr)
+        if err != nil {
+            respondWithError(w, http.StatusBadRequest, "Invalid chirp ID")
+            return
+        }
+
+        // 3. Fetch chirp to check ownership
+        dbChirp, err := apiCfg.dbQueries.GetChirpByID(r.Context(), chirpID)
+        if err != nil {
+            if strings.Contains(err.Error(), "no rows") {
+                respondWithError(w, http.StatusNotFound, "Chirp not found")
+                return
+            }
+            respondWithError(w, http.StatusInternalServerError, "Failed to retrieve chirp")
+            return
+        }
+
+        // 4. Check if the authenticated user is the author
+        if dbChirp.UserID != userID {
+            respondWithError(w, http.StatusForbidden, "You are not the author of this chirp")
+            return
+        }
+
+        // 5. Delete the chirp
+        err = apiCfg.dbQueries.DeleteChirpByID(r.Context(), chirpID)
+        if err != nil {
+            respondWithError(w, http.StatusInternalServerError, "Failed to delete chirp")
+            return
+        }
+
+        // 6. Return 204 No Content
+        w.WriteHeader(http.StatusNoContent)
     })
 
     // ===== LOGIN HANDLER WITH RAW SQL =====
