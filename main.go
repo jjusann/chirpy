@@ -24,6 +24,7 @@ type apiConfig struct {
     dbQueries      *database.Queries
     platform       string
     jwtSecret      string
+    polkaKey       string
     rawDB          *sql.DB
 }
 
@@ -32,6 +33,7 @@ type User struct {
     CreatedAt      time.Time `json:"created_at"`
     UpdatedAt      time.Time `json:"updated_at"`
     Email          string    `json:"email"`
+    IsChirpyRed    bool      `json:"is_chirpy_red"`
     HashedPassword string    `json:"-"`
 }
 
@@ -146,10 +148,16 @@ func main() {
     }
     log.Println("✅ Database connection verified")
 
+    polkaKey := os.Getenv("POLKA_KEY")
+    if polkaKey == "" {
+        log.Fatal("POLKA_KEY environment variable is not set")
+    }
+
     apiCfg := &apiConfig{
         dbQueries: database.New(db),
         platform:  platform,
         jwtSecret: jwtSecret,
+        polkaKey:  polkaKey,
         rawDB:     db,
     }
 
@@ -178,6 +186,7 @@ func main() {
 
     mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
 
+    // ---------- CHIRPS ----------
     mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
         token, err := auth.GetBearerToken(r.Header)
         if err != nil {
@@ -231,122 +240,6 @@ func main() {
         respondWithJSON(w, http.StatusCreated, chirp)
     })
 
-    mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
-        var request struct {
-            Email    string `json:"email"`
-            Password string `json:"password"`
-        }
-        if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-            respondWithError(w, http.StatusBadRequest, "Invalid request body")
-            return
-        }
-
-        if request.Email == "" {
-            respondWithError(w, http.StatusBadRequest, "Email is required")
-            return
-        }
-
-        if len(request.Password) < 4 {
-            respondWithError(w, http.StatusBadRequest, "Password must be at least 4 characters")
-            return
-        }
-
-        hashedPassword, err := auth.HashPassword(request.Password)
-        if err != nil {
-            respondWithError(w, http.StatusInternalServerError, "Failed to hash password")
-            return
-        }
-
-        dbUser, err := apiCfg.dbQueries.CreateUser(r.Context(), database.CreateUserParams{
-            Email:          request.Email,
-            HashedPassword: hashedPassword,
-        })
-        if err != nil {
-            if strings.Contains(err.Error(), "duplicate key") {
-                respondWithError(w, http.StatusConflict, "Email already exists")
-                return
-            }
-            respondWithError(w, http.StatusInternalServerError, "Failed to create user")
-            return
-        }
-
-        user := User{
-            ID:        dbUser.ID,
-            CreatedAt: dbUser.CreatedAt,
-            UpdatedAt: dbUser.UpdatedAt,
-            Email:     dbUser.Email,
-        }
-
-        respondWithJSON(w, http.StatusCreated, user)
-    })
-
-    mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
-        // 1. Extract and validate JWT
-        token, err := auth.GetBearerToken(r.Header)
-        if err != nil {
-            respondWithError(w, http.StatusUnauthorized, err.Error())
-            return
-        }
-
-        userID, err := auth.ValidateJWT(token, apiCfg.jwtSecret)
-        if err != nil {
-            respondWithError(w, http.StatusUnauthorized, "Invalid or expired token")
-            return
-        }
-
-        // 2. Parse request body
-        var request struct {
-            Email    string `json:"email"`
-            Password string `json:"password"`
-        }
-        if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-            respondWithError(w, http.StatusBadRequest, "Invalid request body")
-            return
-        }
-
-        // 3. Validate inputs
-        if request.Email == "" {
-            respondWithError(w, http.StatusBadRequest, "Email is required")
-            return
-        }
-        if len(request.Password) < 4 {
-            respondWithError(w, http.StatusBadRequest, "Password must be at least 4 characters")
-            return
-        }
-
-        // 4. Hash the new password
-        hashedPassword, err := auth.HashPassword(request.Password)
-        if err != nil {
-            respondWithError(w, http.StatusInternalServerError, "Failed to hash password")
-            return
-        }
-
-        // 5. Update user in database
-        dbUser, err := apiCfg.dbQueries.UpdateUser(r.Context(), database.UpdateUserParams{
-            Email:          request.Email,
-            HashedPassword: hashedPassword,
-            ID:             userID,
-        })
-        if err != nil {
-            if strings.Contains(err.Error(), "duplicate key") {
-                respondWithError(w, http.StatusConflict, "Email already exists")
-                return
-            }
-            log.Printf("❌ UpdateUser error: %v", err)
-            respondWithError(w, http.StatusInternalServerError, "Failed to update user")
-            return
-        }
-
-        // 6. Return updated user (without password)
-        user := User{
-            ID:        dbUser.ID,
-            CreatedAt: dbUser.CreatedAt,
-            UpdatedAt: dbUser.UpdatedAt,
-            Email:     dbUser.Email,
-        }
-        respondWithJSON(w, http.StatusOK, user)
-    })
-
     mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
         dbChirps, err := apiCfg.dbQueries.GetChirps(r.Context())
         if err != nil {
@@ -398,7 +291,6 @@ func main() {
     })
 
     mux.HandleFunc("DELETE /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
-        // 1. Extract and validate JWT
         token, err := auth.GetBearerToken(r.Header)
         if err != nil {
             respondWithError(w, http.StatusUnauthorized, err.Error())
@@ -411,7 +303,6 @@ func main() {
             return
         }
 
-        // 2. Get chirp ID from URL
         chirpIDStr := r.PathValue("chirpID")
         chirpID, err := uuid.Parse(chirpIDStr)
         if err != nil {
@@ -419,7 +310,6 @@ func main() {
             return
         }
 
-        // 3. Fetch chirp to check ownership
         dbChirp, err := apiCfg.dbQueries.GetChirpByID(r.Context(), chirpID)
         if err != nil {
             if strings.Contains(err.Error(), "no rows") {
@@ -430,24 +320,163 @@ func main() {
             return
         }
 
-        // 4. Check if the authenticated user is the author
         if dbChirp.UserID != userID {
             respondWithError(w, http.StatusForbidden, "You are not the author of this chirp")
             return
         }
 
-        // 5. Delete the chirp
         err = apiCfg.dbQueries.DeleteChirpByID(r.Context(), chirpID)
         if err != nil {
             respondWithError(w, http.StatusInternalServerError, "Failed to delete chirp")
             return
         }
 
-        // 6. Return 204 No Content
         w.WriteHeader(http.StatusNoContent)
     })
 
-    // ===== LOGIN HANDLER WITH RAW SQL =====
+    // ---------- USERS (raw SQL) ----------
+    mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
+        var request struct {
+            Email    string `json:"email"`
+            Password string `json:"password"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+            respondWithError(w, http.StatusBadRequest, "Invalid request body")
+            return
+        }
+
+        if request.Email == "" {
+            respondWithError(w, http.StatusBadRequest, "Email is required")
+            return
+        }
+        if len(request.Password) < 4 {
+            respondWithError(w, http.StatusBadRequest, "Password must be at least 4 characters")
+            return
+        }
+
+        hashedPassword, err := auth.HashPassword(request.Password)
+        if err != nil {
+            respondWithError(w, http.StatusInternalServerError, "Failed to hash password")
+            return
+        }
+
+        var dbUser struct {
+            ID          uuid.UUID
+            CreatedAt   time.Time
+            UpdatedAt   time.Time
+            Email       string
+            IsChirpyRed bool
+        }
+        err = apiCfg.rawDB.QueryRowContext(r.Context(), `
+            INSERT INTO users (id, created_at, updated_at, email, hashed_password)
+            VALUES (gen_random_uuid(), NOW(), NOW(), $1, $2)
+            RETURNING id, created_at, updated_at, email, is_chirpy_red
+        `, request.Email, hashedPassword).Scan(
+            &dbUser.ID,
+            &dbUser.CreatedAt,
+            &dbUser.UpdatedAt,
+            &dbUser.Email,
+            &dbUser.IsChirpyRed,
+        )
+        if err != nil {
+            if strings.Contains(err.Error(), "duplicate key") {
+                respondWithError(w, http.StatusConflict, "Email already exists")
+                return
+            }
+            log.Printf("Create user error: %v", err)
+            respondWithError(w, http.StatusInternalServerError, "Failed to create user")
+            return
+        }
+
+        user := User{
+            ID:          dbUser.ID,
+            CreatedAt:   dbUser.CreatedAt,
+            UpdatedAt:   dbUser.UpdatedAt,
+            Email:       dbUser.Email,
+            IsChirpyRed: dbUser.IsChirpyRed,
+        }
+
+        respondWithJSON(w, http.StatusCreated, user)
+    })
+
+    mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+        token, err := auth.GetBearerToken(r.Header)
+        if err != nil {
+            respondWithError(w, http.StatusUnauthorized, err.Error())
+            return
+        }
+
+        userID, err := auth.ValidateJWT(token, apiCfg.jwtSecret)
+        if err != nil {
+            respondWithError(w, http.StatusUnauthorized, "Invalid or expired token")
+            return
+        }
+
+        var request struct {
+            Email    string `json:"email"`
+            Password string `json:"password"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+            respondWithError(w, http.StatusBadRequest, "Invalid request body")
+            return
+        }
+
+        if request.Email == "" {
+            respondWithError(w, http.StatusBadRequest, "Email is required")
+            return
+        }
+        if len(request.Password) < 4 {
+            respondWithError(w, http.StatusBadRequest, "Password must be at least 4 characters")
+            return
+        }
+
+        hashedPassword, err := auth.HashPassword(request.Password)
+        if err != nil {
+            respondWithError(w, http.StatusInternalServerError, "Failed to hash password")
+            return
+        }
+
+        var dbUser struct {
+            ID          uuid.UUID
+            CreatedAt   time.Time
+            UpdatedAt   time.Time
+            Email       string
+            IsChirpyRed bool
+        }
+        err = apiCfg.rawDB.QueryRowContext(r.Context(), `
+            UPDATE users
+            SET email = $1, hashed_password = $2, updated_at = NOW()
+            WHERE id = $3
+            RETURNING id, created_at, updated_at, email, is_chirpy_red
+        `, request.Email, hashedPassword, userID).Scan(
+            &dbUser.ID,
+            &dbUser.CreatedAt,
+            &dbUser.UpdatedAt,
+            &dbUser.Email,
+            &dbUser.IsChirpyRed,
+        )
+        if err != nil {
+            if strings.Contains(err.Error(), "duplicate key") {
+                respondWithError(w, http.StatusConflict, "Email already exists")
+                return
+            }
+            log.Printf("Update user error: %v", err)
+            respondWithError(w, http.StatusInternalServerError, "Failed to update user")
+            return
+        }
+
+        user := User{
+            ID:          dbUser.ID,
+            CreatedAt:   dbUser.CreatedAt,
+            UpdatedAt:   dbUser.UpdatedAt,
+            Email:       dbUser.Email,
+            IsChirpyRed: dbUser.IsChirpyRed,
+        }
+
+        respondWithJSON(w, http.StatusOK, user)
+    })
+
+    // ---------- LOGIN (raw SQL) ----------
     mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
         defer func() {
             if r := recover(); r != nil {
@@ -466,16 +495,16 @@ func main() {
             return
         }
 
-        // Use raw SQL for user lookup to bypass sqlc issues
         var dbUser struct {
             ID             uuid.UUID
             CreatedAt      time.Time
             UpdatedAt      time.Time
             Email          string
+            IsChirpyRed    bool
             HashedPassword string
         }
         err := apiCfg.rawDB.QueryRowContext(r.Context(), `
-            SELECT id, created_at, updated_at, email, hashed_password
+            SELECT id, created_at, updated_at, email, is_chirpy_red, hashed_password
             FROM users
             WHERE email = $1
         `, request.Email).Scan(
@@ -483,6 +512,7 @@ func main() {
             &dbUser.CreatedAt,
             &dbUser.UpdatedAt,
             &dbUser.Email,
+            &dbUser.IsChirpyRed,
             &dbUser.HashedPassword,
         )
         if err != nil {
@@ -490,26 +520,23 @@ func main() {
                 respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
                 return
             }
-            log.Printf("❌ Query error: %v", err)
+            log.Printf("Login query error: %v", err)
             respondWithError(w, http.StatusInternalServerError, "Failed to retrieve user")
             return
         }
 
-        // Check password
         valid, err := auth.CheckPasswordHash(request.Password, dbUser.HashedPassword)
         if err != nil || !valid {
             respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
             return
         }
 
-        // Generate access token
         accessToken, err := auth.MakeJWT(dbUser.ID, apiCfg.jwtSecret, time.Hour)
         if err != nil {
             respondWithError(w, http.StatusInternalServerError, "Failed to generate access token")
             return
         }
 
-        // Generate refresh token
         refreshToken, err := auth.MakeRefreshToken()
         if err != nil {
             respondWithError(w, http.StatusInternalServerError, "Failed to generate refresh token")
@@ -522,16 +549,17 @@ func main() {
             VALUES ($1, NOW(), NOW(), $2, $3, NULL)
         `, refreshToken, dbUser.ID, expiresAt)
         if err != nil {
-            log.Printf("❌ Insert refresh token error: %v", err)
+            log.Printf("Insert refresh token error: %v", err)
             respondWithError(w, http.StatusInternalServerError, "Failed to store refresh token")
             return
         }
 
         user := User{
-            ID:        dbUser.ID,
-            CreatedAt: dbUser.CreatedAt,
-            UpdatedAt: dbUser.UpdatedAt,
-            Email:     dbUser.Email,
+            ID:          dbUser.ID,
+            CreatedAt:   dbUser.CreatedAt,
+            UpdatedAt:   dbUser.UpdatedAt,
+            Email:       dbUser.Email,
+            IsChirpyRed: dbUser.IsChirpyRed,
         }
 
         response := struct {
@@ -547,7 +575,7 @@ func main() {
         respondWithJSON(w, http.StatusOK, response)
     })
 
-    // ===== REFRESH AND REVOKE ENDPOINTS =====
+    // ---------- REFRESH & REVOKE (use sqlc, but may also need raw SQL) ----------
     mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
         refreshToken, err := auth.GetBearerToken(r.Header)
         if err != nil {
@@ -592,6 +620,67 @@ func main() {
         w.WriteHeader(http.StatusNoContent)
     })
 
+    // ---------- POLKA WEBHOOK (raw SQL) ----------
+    mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+        // 1. Validate API key
+        apiKey, err := auth.GetAPIKey(r.Header)
+        if err != nil {
+            respondWithError(w, http.StatusUnauthorized, err.Error())
+            return
+        }
+
+        if apiKey != apiCfg.polkaKey {
+            respondWithError(w, http.StatusUnauthorized, "Invalid API key")
+            return
+        }
+
+        // 2. Parse request body
+        var req struct {
+            Event string `json:"event"`
+            Data   struct {
+                UserID string `json:"user_id"`
+            } `json:"data"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+            respondWithError(w, http.StatusBadRequest, "Invalid request body")
+            return
+        }
+
+        // 3. Ignore any event other than user.upgraded
+        if req.Event != "user.upgraded" {
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+
+        // 4. Validate user ID format
+        userID, err := uuid.Parse(req.Data.UserID)
+        if err != nil {
+            respondWithError(w, http.StatusBadRequest, "Invalid user_id format")
+            return
+        }
+
+        // 5. Upgrade user to Chirpy Red
+        result, err := apiCfg.rawDB.ExecContext(r.Context(), `
+            UPDATE users
+            SET is_chirpy_red = TRUE, updated_at = NOW()
+            WHERE id = $1
+        `, userID)
+        if err != nil {
+            log.Printf("Upgrade user error: %v", err)
+            respondWithError(w, http.StatusInternalServerError, "Failed to upgrade user")
+            return
+        }
+
+        rowsAffected, _ := result.RowsAffected()
+        if rowsAffected == 0 {
+            respondWithError(w, http.StatusNotFound, "User not found")
+            return
+        }
+
+        w.WriteHeader(http.StatusNoContent)
+    })
+
+    // ---------- SERVER ----------
     server := http.Server{
         Addr:    ":8080",
         Handler: mux,
